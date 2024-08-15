@@ -369,7 +369,7 @@ class TravelDealsBot:
             await asyncio.sleep(60 * 5)
 
 
-async def main():
+async def main_run_bot():
     Logger.info("Bot Initialisation")
     BOT_TOKEN = os.getenv("TELEGRAM_BOT_FLIGHT_SEARCH_TOKEN")
     CHAT_ID = os.getenv("TELEGRAM_BOT_FLIGHT_SEARCH_CHAT_ID")
@@ -388,4 +388,4 @@ async def main():
 
     await travel_bot.run()
 
-asyncio.run(main())
+    
