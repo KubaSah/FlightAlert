@@ -113,15 +113,15 @@ class DatabaseManager:
                 cursor.execute(
                     """
                     INSERT INTO destination_changes (
-                        price, country, name, airports, brand, dates, date, provider
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        price, country, name, airports, brand, dates, date, provider, active
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, True)
                     ON CONFLICT (price, country, name, airports, brand, dates) DO NOTHING
                     """,
                     (
                         row["DataLayer"]["price"],
                         row["Panstwo"],
                         row["Nazwa"],
-                        "-".join(row["DataLayer"]["name"].split(" ")[-4:-2]),
+                        "".join(row["DataLayer"]["name"].split(" ")[-4:-1]),
                         row["DataLayer"]["brand"],
                         row["TerminWyjazdu"].split(" ")[0],
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -129,6 +129,84 @@ class DatabaseManager:
                     ),
                 )
             self.connection.commit()
+        except Exception as e:
+            Logger.error(f"{e}")
+        finally:
+            self.connection.close()
+
+    def check_active(self, rows):
+        try:
+            self.connect()
+            cursor = self.connection.cursor()
+            Logger.info("Checking and updating active status in Database")
+
+            # Create a temporary table with consistent data types
+            cursor.execute("""
+                CREATE TEMPORARY TABLE temp_changes (
+                    price DOUBLE PRECISION, 
+                    country TEXT, 
+                    name TEXT, 
+                    airports TEXT, 
+                    brand TEXT, 
+                    dates TEXT
+                )
+            """)
+
+            # Prepare data for insertion, handle empty or invalid dates
+            def format_date(date_str):
+                try:
+                    # Try parsing the date string
+                    return datetime.strptime(date_str, '%Y-%m-%d').date()
+                except ValueError:
+                    # Return None if the date format is invalid
+                    return None
+
+            insert_data = [
+                (
+                    row["DataLayer"]["price"],
+                    row["Panstwo"],
+                    row["Nazwa"],
+                    "".join(row["DataLayer"]["name"].split(" ")[-4:-1]),
+                    row["DataLayer"]["brand"],
+                    format_date(row["TerminWyjazdu"].split(" ")[0])  # Handle date formatting
+                )
+                for _, row in rows
+            ]
+
+            # Insert data into the temporary table
+            cursor.executemany(
+                """
+                INSERT INTO temp_changes (price, country, name, airports, brand, dates)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                insert_data
+            )
+
+            # Update all records to inactive that are not in the temporary table
+            cursor.execute(
+                """
+                UPDATE destination_changes
+                SET active = False
+                WHERE (price, country, name, airports, brand, dates) NOT IN (
+                    SELECT price, country, name, airports, brand, dates FROM temp_changes
+                )
+                """
+            )
+
+            # Update records in destination_changes to active
+            cursor.execute(
+                """
+                UPDATE destination_changes
+                SET active = True
+                WHERE (price, country, name, airports, brand, dates) IN (
+                    SELECT price, country, name, airports, brand, dates FROM temp_changes
+                )
+                """
+            )
+
+            # Commit changes
+            self.connection.commit()
+
         except Exception as e:
             Logger.error(f"{e}")
         finally:
@@ -160,16 +238,27 @@ class DataFetcher:
             "provider": [],
         }
 
-        await self.fetch_rainbow_data(data)
-        await self.fetch_tui_data(data)
+        dataAll = {
+            "Panstwo": [],
+            "Nazwa": [],
+            "Klucz": [],
+            "TerminWyjazdu": [],
+            "Cena": [],
+            "DataLayer": [],
+            "provider": [],
+        }
+
+        await self.fetch_rainbow_data(data, dataAll)
+        await self.fetch_tui_data(data, dataAll)
         # await self.fetch_itaka_data(data)
 
         self.check_data_lengths(data)
+        self.check_data_lengths(dataAll)
 
         Logger.info("Fetching Data Completed")
-        return pd.DataFrame(data)
+        return pd.DataFrame(data), pd.DataFrame(dataAll)
 
-    async def fetch_rainbow_data(self, data):
+    async def fetch_rainbow_data(self, data, dataAll):
         try:
             Logger.info("Fetching Rainbow Data")
             url = "https://biletyczarterowe.r.pl/api/wyszukiwanie/wyszukaj?oneWay=false&dataUrodzenia%5B%5D=1989-10-30&dataUrodzenia%5B%5D=1989-10-30&sortowanie=cena"
@@ -198,10 +287,24 @@ class DataFetcher:
                     data["DataLayer"].append(destynacja["DataLayer"])
                     data["provider"].append("Rainbow")
                     self.used.append(usedstring)
+
+                dataAll["Panstwo"].append(destynacja["Panstwo"])
+                dataAll["Nazwa"].append(destynacja["Nazwa"])
+                dataAll["Klucz"].append(destynacja["Klucz"])
+                dataAll["TerminWyjazdu"].append(
+                    str(
+                        datetime.strptime(
+                            destynacja["TerminWyjazdu"], "%Y-%m-%dT%H:%M:%SZ"
+                        )
+                    )
+                )
+                dataAll["Cena"].append(int(str(destynacja["Cena"]).replace(" ", "")))
+                dataAll["DataLayer"].append(destynacja["DataLayer"])
+                dataAll["provider"].append("Rainbow")
         except Exception as e:
             Logger.error(f"[Error][fetch_rainbow_data]: {e}")
 
-    async def fetch_tui_data(self, data):
+    async def fetch_tui_data(self, data, dataAll):
         try:
             Logger.info("Fetching TUI Data")
             url = "https://www.tui.pl/api/www/multiCharters"
@@ -236,10 +339,28 @@ class DataFetcher:
                     )
                     data["provider"].append("TUI")
                     self.used.append(usedstring)
+                dataAll["Panstwo"].append(destynacja["countryName"])
+                dataAll["Nazwa"].append(destynacja["destinationName"])
+                dataAll["Klucz"].append(destynacja["airportCode"])
+                dataAll["TerminWyjazdu"].append("")
+                dataAll["Cena"].append(
+                    int(str(destynacja["perPersonPrice"]).replace(" ", ""))
+                )
+                dataAll["DataLayer"].append(
+                    {
+                        "brand": "TUI",
+                        "price": int(
+                            str(destynacja["perPersonPrice"]).replace(" ", "")
+                        ),
+                        "name": destynacja["destinationName"]
+                        + f" WAW - {destynacja['airportCode']} NA/NA/NA",
+                    }
+                )
+                dataAll["provider"].append("TUI")
         except Exception as e:
             Logger.error(f"{e}")
 
-    async def fetch_itaka_data(self, data):
+    async def fetch_itaka_data(self, data, dataAll):
         try:
             Logger.info("Fetching ITAKA Data")
             i = 1
@@ -311,6 +432,30 @@ class DataFetcher:
                             )
                             data["provider"].append("ITAKA")
                             self.used.append(usedstring)
+                        dataAll["Panstwo"].append("Nieznane")
+                        dataAll["Nazwa"].append(el["departureRoute"]["airport"]["city"])
+                        dataAll["Klucz"].append(el["departureRoute"]["airport"]["iata"])
+                        dataAll["TerminWyjazdu"].append(
+                            str(
+                                datetime.strptime(
+                                    el["departureRoute"]["date"],
+                                    "%Y-%m-%dT%H:%M:%S",
+                                )
+                            )
+                        )
+                        dataAll["Cena"].append(
+                            int(str(el["pricePerPerson"]["amount"]).replace(" ", ""))
+                        )
+                        dataAll["DataLayer"].append(
+                            {
+                                "brand": "ITAKA",
+                                "price": int(
+                                    str(el["pricePerPerson"]["amount"]).replace(" ", "")
+                                ),
+                                "name": f"{el['departureRoute']['airport']['iata']} WAW",
+                            }
+                        )
+                        dataAll["provider"].append("ITAKA")
                 if i > 0:
                     i += 1
                 else:
@@ -328,11 +473,13 @@ class TravelDealsBot:
         self.data_fetcher = data_fetcher
 
     async def send_messages(self):
-        Logger.info("Sending message to Telegram!")
-        df = await self.data_fetcher.fetch_data()
-        self.db_manager.add_to_db(df.iterrows())
+        df, dfAll = await self.data_fetcher.fetch_data()
+        Logger.info("Updating DB Data!")
+        self.db_manager.add_to_db(dfAll.iterrows())
+        self.db_manager.check_active(dfAll.iterrows())
 
         if not df.empty:
+            Logger.info("Sending message to Telegram!")
             separator = "- - - - - - - - - - - - -"
             df = df.reset_index()
             df = df.sort_values(by="Cena")
@@ -362,11 +509,11 @@ class TravelDealsBot:
             if message_string != "":
                 await self.bot.send_message(self.chat_id, message_string)
 
-    async def run(self, interval=10 * 60):
+    async def run(self, interval=5 * 60):
         Logger.info("Application started!")
         while True:
             await self.send_messages()
-            await asyncio.sleep(60 * 5)
+            await asyncio.sleep(interval)
 
 
 async def main_run_bot():
@@ -387,5 +534,3 @@ async def main_run_bot():
     db_manager.create_table()
 
     await travel_bot.run()
-
-    
